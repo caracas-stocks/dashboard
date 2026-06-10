@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.log
+bvc_run.log
+.DS_Store
+.idea/
+.vscode/
+*.tmp
+*.swp
+# Daily reports (regenerated each run, not deployed)
+bvc_report_*.html
+bvc_data.xlsx

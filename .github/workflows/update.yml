@@ -1,0 +1,97 @@
+name: Update BVC Dashboard
+
+on:
+  # Every 15 minutes during Caracas market hours, Mon-Fri
+  # VET 09:00-13:15 = UTC 13:00-17:15
+  schedule:
+    - cron: '0,15,30,45 13-17 * * 1-5'
+  # Manual trigger from the Actions tab
+  workflow_dispatch:
+
+# Allow the workflow to commit back to the repo
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: bvc-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # Need full history so we can commit and push
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Set Caracas timezone
+        run: |
+          sudo timedatectl set-timezone America/Caracas || true
+          echo "Current time: $(date)"
+
+      - name: Sync BVC stocks + indexes + official FX
+        run: python bvc.py --once
+        continue-on-error: true
+
+      - name: Sync parallel FX rate (p2p.army)
+        run: python load_parallel_rates.py
+        continue-on-error: true
+
+      - name: Rebuild dashboard HTML
+        run: |
+          python build_dashboard.py
+          # Pages serves index.html at the root
+          cp bvc_dashboard.html index.html
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bvc.db index.html bvc_dashboard.html
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "data: auto-update $(date -u +'%Y-%m-%d %H:%MZ')"
+            git push
+          fi
+
+  deploy-pages:
+    needs: update
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout (post-update)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
