@@ -1,4 +1,3 @@
-import os
 import re, time, logging, sqlite3, warnings
 import datetime
 from datetime import date
@@ -12,7 +11,7 @@ log = logging.getLogger("bvc")
 
 BASE_URL   = "https://www.bolsadecaracas.com/wp-admin/admin-ajax.php"
 MARKET_URL = "https://market.bolsadecaracas.com/es"
-DB_PATH  = os.environ.get("BVC_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bvc.db"))
+DB_PATH    = r"C:\Users\miguelperez\Desktop\bvc_database\bvc.db"
 
 HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded",
@@ -387,74 +386,55 @@ def _parse_es_num(s):
 
 def sync_today_from_market_website():
     """
-    Scrape today's closing prices from market.bolsadecaracas.com.
-    That site updates same-day (within minutes of market close), unlike the
-    legacy bolsadecaracas.com API which lags until the next morning.
+    Fetch today's live prices from the bolsadecaracas.com legacy API
+    (resumenMercadoRentaVariable). Updates in real time during market hours.
 
-    Table column layout (0-indexed td):
-      0  = empty  |  1 = "Ver Libro"  |  2 = name  |  3 = symbol
-      4  = VOL_CMP  |  5 = PRE_CMP  |  6 = PRE_VTA  |  7 = VOL_VTA
-      8  = PRECIO (close)  |  9 = PRECIO_APERT (open)
-      10 = VAR_REL %  |  11 = VAR_ABS
-      12 = VOLUMEN (shares)  |  13 = MONTO_EFECTIVO (Bs.)
-      14 = TOT_OP_NEGOC  |  15 = PRECIO_MAX  |  16 = PRECIO_MIN
+    Fallback: if the API returns no data, try scraping the same-day HTML
+    from market.bolsadecaracas.com (currently returning 401, but kept as
+    backup in case the API breaks in the future).
     """
-    log.info("Syncing today's prices from market.bolsadecaracas.com ...")
-    mkt_session = requests.Session()
-    mkt_session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; BVC-DataBot/1.0)",
-        "Accept-Language": "es-VE,es;q=0.9",
-    })
+    log.info("Syncing today's prices from resumenMercadoRentaVariable ...")
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            resp = mkt_session.get(MARKET_URL, timeout=30, verify=False)
-        resp.raise_for_status()
+        rows = post("resumenMercadoRentaVariable")
     except Exception as e:
-        log.error(f"Could not fetch market website: {e}")
+        log.error(f"resumenMercadoRentaVariable failed: {e}")
         return
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    if not rows:
+        log.warning("resumenMercadoRentaVariable returned empty list.")
+        return
 
-    # Extract the trading date from the page heading
-    # e.g. "SITUACIÓN DEL MERCADO: CERRADO 30/03/2026"
     fecha_today = date.today().isoformat()
-    heading = soup.find(string=re.compile(r'\d{2}/\d{2}/\d{4}'))
-    if heading:
-        m = re.search(r'(\d{2})/(\d{2})/(\d{4})', heading)
-        if m:
-            fecha_today = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-
-    table = soup.find("table")
-    if not table:
-        log.warning("No table found on market.bolsadecaracas.com — page structure may have changed.")
-        return
-
     conn = get_conn()
     saved = 0
 
-    for tr in table.find_all("tr"):
-        cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-        if len(cells) < 17:
+    for r in rows:
+        cod_simb = (r.get("COD_SIMB") or "").strip()
+        if not cod_simb:
             continue
 
-        cod_simb = cells[3].strip()
-        if not cod_simb or cod_simb == "Símbolo":
-            continue
-
-        precio_cie      = _parse_es_num(cells[8])
+        precio_cie   = clean_number(r.get("PRECIO"))
         if precio_cie is None:
-            continue                              # skip rows with no price
+            continue
 
-        precio_apert    = _parse_es_num(cells[9])
-        var_rel         = _parse_es_num(cells[10])
-        var_abs         = _parse_es_num(cells[11])
-        tot_acciones    = _parse_es_num(cells[12])
-        tot_monto       = _parse_es_num(cells[13])
-        ops_str         = cells[14].strip().replace(".", "").replace(",", "")
-        tot_operaciones = int(ops_str) if ops_str.isdigit() else None
-        precio_max      = _parse_es_num(cells[15])
-        precio_min      = _parse_es_num(cells[16])
+        var_abs      = clean_number(r.get("VAR_ABS"))
+        var_rel      = clean_number(r.get("VAR_REL"))
+        tot_acciones = clean_number(r.get("VOLUMEN"))
+        tot_monto    = clean_number(r.get("MONTO_EFECTIVO"))
+
+        # This endpoint doesn't return open/high/low/op-count.
+        # Preserve any existing values for today so we don't overwrite
+        # richer data captured by sync_stock_history the next morning.
+        existing = conn.execute(
+            "SELECT precio_apert, precio_max, precio_min, tot_operaciones "
+            "FROM stock_daily WHERE cod_simb=? AND fecha=?",
+            (cod_simb, fecha_today),
+        ).fetchone()
+
+        precio_apert    = existing["precio_apert"]    if existing else None
+        precio_max      = existing["precio_max"]      if existing else None
+        precio_min      = existing["precio_min"]      if existing else None
+        tot_operaciones = existing["tot_operaciones"] if existing else None
 
         conn.execute("""
             INSERT OR REPLACE INTO stock_daily
@@ -472,7 +452,8 @@ def sync_today_from_market_website():
 
     conn.commit()
     conn.close()
-    log.info(f"market.bolsadecaracas.com: {saved} stocks saved for {fecha_today}.")
+    log.info(f"resumenMercadoRentaVariable: {saved} stocks saved for {fecha_today}.")
+    _log_sync("today_prices", saved)
 
 
 # ── Scheduled jobs ────────────────────────────────────────────────────────────
