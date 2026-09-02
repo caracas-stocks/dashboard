@@ -622,6 +622,78 @@ function handleOverlayClick(e) { if(e.target===document.getElementById('detailOv
 renderTable();
 document.querySelectorAll('#stockHead th')[5].classList.add('sort-desc');
 applyRange(365);
+
+// ── Live refresh via Cloudflare Worker (CORS proxy for BVC API) ─────────────
+const LIVE_REFRESH_MS = 30000;
+const PROXY_URL = 'https://bvc-proxy.miguelperezb-14.workers.dev/wp-admin/admin-ajax.php';
+
+async function _liveFetch() {
+  try {
+    const r = await fetch(PROXY_URL, {
+      method:  'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body:    'action=resumenMercadoRentaVariable',
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { console.warn('live refresh failed:', e); return null; }
+}
+
+function _liveApply(rows) {
+  const rateOf  = FX_OF[FX_OF.length - 1]   || 0;
+  const ratePar = FX_PAR[FX_PAR.length - 1] || 0;
+  if (!rateOf) return 0;
+  let n = 0;
+  for (const row of rows) {
+    const sym = (row.COD_SIMB || '').trim();
+    if (!sym) continue;
+    const s = STOCKS.find(x => x.sym === sym);
+    if (!s) continue;
+    const price = parseFloat(row.PRECIO);
+    const chg   = parseFloat(row.VAR_REL);
+    const monto = parseFloat(row.MONTO_EFECTIVO);
+    if (isFinite(price)) {
+      s.price_bsd     = price;
+      s.price_usd     = rateOf  ? price / rateOf  : s.price_usd;
+      s.price_usd_par = ratePar ? price / ratePar : s.price_usd_par;
+      if (s.shares) {
+        s.mktcap_usd     = rateOf  ? (s.shares * price) / rateOf  : s.mktcap_usd;
+        s.mktcap_usd_par = ratePar ? (s.shares * price) / ratePar : s.mktcap_usd_par;
+      }
+    }
+    if (isFinite(chg))   s.chg = chg;
+    if (isFinite(monto)) {
+      s.monto_bsd = monto;
+      s.monto_usd = rateOf ? monto / rateOf : s.monto_usd;
+    }
+    n++;
+  }
+  return n;
+}
+
+function _liveStatus(msg, isError) {
+  let el = document.getElementById('liveStatus');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'liveStatus';
+    el.style.cssText = 'position:fixed;bottom:12px;right:12px;background:rgba(0,0,0,.78);font:12px system-ui;padding:6px 10px;border-radius:6px;z-index:9999;color:#7fffbf;';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.color = isError ? '#ff6b6b' : '#7fffbf';
+}
+
+async function _liveTick() {
+  const t = new Date().toLocaleTimeString('es-VE', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  const rows = await _liveFetch();
+  if (!rows) { _liveStatus('sin señal · ' + t, true); return; }
+  const n = _liveApply(rows);
+  try { renderTable(); } catch(e) {}
+  _liveStatus('en vivo · ' + n + ' tickers · ' + t, false);
+}
+
+_liveTick();
+setInterval(_liveTick, LIVE_REFRESH_MS);
 </script>
 </body>
 </html>
