@@ -27,6 +27,14 @@ def fmt_m(v):
 def pct(v):
     return f"{v:+.0f}%" if v is not None else "—"
 
+def delta_html(v, decimals=1):
+    """Render a signed % change with a triangle icon and semantic color."""
+    if v is None:
+        return '<span style="color:var(--muted)">—</span>'
+    color = "var(--green)" if v > 0 else "var(--red)" if v < 0 else "var(--muted)"
+    arrow = "▲" if v > 0 else "▼" if v < 0 else "─"
+    return f'<span style="color:{color}">{arrow} {abs(v):.{decimals}f}%</span>'
+
 # ── query ─────────────────────────────────────────────────────────────────────
 # SQLite file-locking doesn't work reliably on network/FUSE mounts.
 # Copy the DB to a local temp file before opening to avoid "unable to open" errors.
@@ -60,6 +68,37 @@ latest_fx     = conn.execute("SELECT * FROM exchange_rates WHERE usd_oficial  IS
 latest_par_fx = conn.execute("SELECT * FROM exchange_rates WHERE usd_paralelo IS NOT NULL ORDER BY fecha DESC LIMIT 1").fetchone()
 latest_of  = latest_fx["usd_oficial"]    if latest_fx     else None
 latest_par = latest_par_fx["usd_paralelo"] if latest_par_fx else None
+
+# 1D and YTD % change for both FX rates
+def _pct(cur, base):
+    if cur is None or base is None or base == 0: return None
+    return (cur / base - 1) * 100
+
+prev_of_row = conn.execute("""
+    SELECT usd_oficial FROM exchange_rates
+    WHERE usd_oficial IS NOT NULL AND fecha < ?
+    ORDER BY fecha DESC LIMIT 1
+""", (latest_fx["fecha"] if latest_fx else "9999-12-31",)).fetchone()
+prev_par_row = conn.execute("""
+    SELECT usd_paralelo FROM exchange_rates
+    WHERE usd_paralelo IS NOT NULL AND fecha < ?
+    ORDER BY fecha DESC LIMIT 1
+""", (latest_par_fx["fecha"] if latest_par_fx else "9999-12-31",)).fetchone()
+ytd_of_base_row = conn.execute("""
+    SELECT usd_oficial FROM exchange_rates
+    WHERE usd_oficial IS NOT NULL AND fecha < strftime('%Y-01-01','now')
+    ORDER BY fecha DESC LIMIT 1
+""").fetchone()
+ytd_par_base_row = conn.execute("""
+    SELECT usd_paralelo FROM exchange_rates
+    WHERE usd_paralelo IS NOT NULL AND fecha < strftime('%Y-01-01','now')
+    ORDER BY fecha DESC LIMIT 1
+""").fetchone()
+
+of_1d  = _pct(latest_of,  prev_of_row["usd_oficial"]  if prev_of_row  else None)
+par_1d = _pct(latest_par, prev_par_row["usd_paralelo"] if prev_par_row else None)
+of_ytd  = _pct(latest_of,  ytd_of_base_row["usd_oficial"]  if ytd_of_base_row  else None)
+par_ytd = _pct(latest_par, ytd_par_base_row["usd_paralelo"] if ytd_par_base_row else None)
 
 # --- IBC index ---
 # Use forward-fill for exchange rates: join to the most recent rate on or before
@@ -104,8 +143,8 @@ ytd_start_row = conn.execute("""
         SELECT MAX(fecha) FROM exchange_rates
         WHERE fecha <= i.fecha AND usd_oficial IS NOT NULL
     )
-    WHERE i.index_code='IBC' AND i.fecha >= strftime('%Y-01-01','now')
-    ORDER BY i.fecha ASC LIMIT 1
+    WHERE i.index_code='IBC' AND i.fecha < strftime('%Y-01-01','now')
+    ORDER BY i.fecha DESC LIMIT 1
 """).fetchone()
 
 latest_ibc_val = latest_ibc_row["precio"] if latest_ibc_row else 0
@@ -126,10 +165,18 @@ if ytd_start_date:
     ytd_start_fmt = f"{int(p[2])} {MONTHS_ES[int(p[1])-1]}"
 
 # --- Latest stock data ---
+# `market_last_day` = last trading day across all stocks. Used to decide
+# whether a specific ticker traded on the market's most recent session.
+market_last_day = conn.execute("SELECT MAX(fecha) FROM stock_daily").fetchone()[0]
+
 stocks_raw = conn.execute("""
     SELECT s.cod_simb, s.desc_simb, s.acc_circ,
-           sd.fecha, sd.precio_cie, sd.var_rel, sd.tot_operaciones,
+           sd.fecha, sd.precio_cie, sd.tot_operaciones,
            CASE WHEN sd.fecha<'2021-10-01' THEN sd.tot_monto/1000000.0 ELSE sd.tot_monto END AS monto_bsd,
+           -- previous trade day's close for this stock, for a real 1D change
+           (SELECT precio_cie FROM stock_daily sd2
+             WHERE sd2.cod_simb=s.cod_simb AND sd2.fecha<sd.fecha
+             ORDER BY sd2.fecha DESC LIMIT 1) AS prev_close,
            fx.usd_oficial, fx.usd_paralelo
     FROM symbols s
     JOIN stock_daily sd ON s.cod_simb=sd.cod_simb
@@ -141,6 +188,11 @@ stocks_raw = conn.execute("""
       AND sd.fecha=(SELECT MAX(fecha) FROM stock_daily WHERE cod_simb=s.cod_simb)
     ORDER BY s.cod_simb
 """).fetchall()
+
+def _days_between(iso_a, iso_b):
+    from datetime import date as _d
+    a = _d.fromisoformat(iso_a); b = _d.fromisoformat(iso_b)
+    return (b - a).days
 
 stocks = []
 total_mktcap_of = total_mktcap_par = 0
@@ -154,13 +206,26 @@ for r in stocks_raw:
     mktcap_par = p * shares / par if par else None
     if mktcap_of:  total_mktcap_of  += mktcap_of
     if mktcap_par: total_mktcap_par += mktcap_par
+
+    days_stale = _days_between(r["fecha"], market_last_day) if market_last_day else 0
+
+    # Var 1D%: only meaningful if the stock actually traded on the market's
+    # most recent trading day. If it didn't trade, its 1D change is 0.
+    if days_stale > 0:
+        chg = 0.0
+    else:
+        prev = r["prev_close"]
+        chg  = round((p / prev - 1) * 100, 2) if (p and prev and prev > 0) else None
+
     stocks.append({
         "sym": r["cod_simb"], "name": r["desc_simb"],
         "fecha": r["fecha"],
+        "days_stale": days_stale,
         "price_bsd":     round(p, 2),
         "price_usd":     round(p/of, 4) if of else None,
         "price_usd_par": round(p/par, 4) if par else None,
-        "chg":  r["var_rel"], "ops": r["tot_operaciones"],
+        "chg": chg,
+        "ops": r["tot_operaciones"],
         "monto_bsd": round(m, 2),
         "monto_usd": round(m/of, 2) if (of and m) else 0,
         "mktcap_usd":     round(mktcap_of,  0),
@@ -192,11 +257,9 @@ for r in vol_rows:
     vol_bsd.append(round(bsd, 0))
 
 # YTD volume
-ytd_vol = sum(
-    (r["monto_bsd"] or 0) / r["usd_oficial"]
-    for r in vol_rows
-    if r["fecha"] >= f"{date.today().year}-01-01" and r["usd_oficial"]
-)
+ytd_vol_rows = [r for r in vol_rows if r["fecha"] >= f"{date.today().year}-01-01" and r["usd_oficial"]]
+ytd_vol = sum((r["monto_bsd"] or 0) / r["usd_oficial"] for r in ytd_vol_rows)
+ytd_trading_days = len(ytd_vol_rows)
 
 # --- Per-stock history ---
 hist_rows = conn.execute("""
@@ -388,23 +451,23 @@ html = f"""<!DOCTYPE html>
     <div class="kpi-card">
       <div class="kpi-label">Capitalización Total</div>
       <div class="kpi-value" style="color:var(--accent);font-size:18px">{fmt_m(total_mktcap_of)}</div>
-      <div class="kpi-sub">USD Oficial &nbsp;·&nbsp; {fmt_m(total_mktcap_par)} paralelo</div>
+      <div class="kpi-sub">Oficial &nbsp;·&nbsp; {fmt_m(total_mktcap_par)} paralelo</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">IBC — Índice BVC</div>
       <div class="kpi-value">{latest_ibc_val:,.0f} <small style="font-size:12px;color:var(--muted)">Bs.</small></div>
-      <div class="kpi-sub pos">{ytd_bsd_str} Bs.D &nbsp;·&nbsp; {ytd_of_str} USD oficial &nbsp;·&nbsp; {ytd_par_str} USD paralelo</div>
+      <div class="kpi-sub">{delta_html(ytd_chg_bsd)}&nbsp; Bs.D &nbsp;·&nbsp; {delta_html(ytd_chg_of)}&nbsp; USD of &nbsp;·&nbsp; {delta_html(ytd_chg_par)}&nbsp; USD par</div>
       <div class="kpi-sub">YTD {cur_year} (desde {ytd_start_fmt})</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">USD Oficial (BCV)</div>
       <div class="kpi-value">{latest_of:,.2f} <small style="font-size:12px;color:var(--muted)">Bs.</small></div>
-      <div class="kpi-sub">por dólar · hoy</div>
+      <div class="kpi-sub">{delta_html(of_1d)}&nbsp; Δ 1d &nbsp;·&nbsp; {delta_html(of_ytd)}&nbsp; Δ ytd</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">USD Paralelo (P2P)</div>
       <div class="kpi-value">{latest_par:,.2f} <small style="font-size:12px;color:var(--muted)">Bs.</small></div>
-      <div class="kpi-sub neg">+{spread_pct:.1f}% vs oficial</div>
+      <div class="kpi-sub">{delta_html(par_1d)}&nbsp; Δ 1d &nbsp;·&nbsp; {delta_html(par_ytd)}&nbsp; Δ ytd</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Spread Cambiario</div>
@@ -414,12 +477,12 @@ html = f"""<!DOCTYPE html>
     <div class="kpi-card">
       <div class="kpi-label">Vol. Negociado YTD</div>
       <div class="kpi-value" style="color:var(--blue);font-size:18px">{fmt_m(ytd_vol)}</div>
-      <div class="kpi-sub">USD Oficial — {cur_year}</div>
+      <div class="kpi-sub">Renta Variable · {ytd_trading_days} días · {cur_year}</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Acciones Listadas</div>
       <div class="kpi-value">{n_stocks}</div>
-      <div class="kpi-sub">tickers en RV (varias por empresa)</div>
+      <div class="kpi-sub">tickers RV (varias por empresa)</div>
     </div>
   </div>
 
@@ -596,12 +659,23 @@ function fmtM(v) {{
   if (v >= 1e3) return '$' + (v/1e3).toFixed(0) + 'K';
   return '$' + v.toFixed(0);
 }}
-function chgHtml(v) {{
-  if (v == null) return '<span class="pill n">—</span>';
-  var cls = v > 0.05 ? 'g' : v < -0.05 ? 'r' : 'n';
-  var sign = v > 0 ? '+' : '';
-  return '<span class="pill ' + cls + '">' + sign + fmtN(v,2) + '%</span>';
+// Unified delta format used across KPIs, table and detail overlay.
+// Matches the Python delta_html() so nothing looks out of place.
+function deltaHtml(v, opts) {{
+  opts = opts || {{}};
+  if (v == null) return '<span style="color:var(--muted)">—</span>';
+  var stale = opts.stale || 0;
+  var suffix = opts.suffix || '';
+  var tip = '';
+  if (stale > 0) {{
+    v = 0;
+    tip = ' title="Últ. operación hace ' + stale + ' día' + (stale === 1 ? '' : 's') + '"';
+  }}
+  var color = v > 0.05 ? 'var(--green)' : v < -0.05 ? 'var(--red)' : 'var(--muted)';
+  var arrow = v > 0.05 ? '▲' : v < -0.05 ? '▼' : '─';
+  return '<span style="color:' + color + '"' + tip + '>' + arrow + ' ' + fmtN(Math.abs(v), 2) + '%' + (suffix ? ' ' + suffix : '') + '</span>';
 }}
+function chgHtml(v, stale) {{ return deltaHtml(v, {{stale: stale}}); }}
 var MO = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function fmtMo(d) {{ var p=d.split('-'); return MO[+p[1]-1]+" '"+p[0].slice(2); }}
 
@@ -792,7 +866,7 @@ function renderTable() {{
       +'<td class="company" title="'+s.name+'">'+s.name+'</td>'
       +'<td>'+(pUsd!=null?'$'+fmtN(pUsd,4):'—')+'</td>'
       +'<td>'+fmtN(s.price_bsd,2)+'</td>'
-      +'<td>'+chgHtml(s.chg)+'</td>'
+      +'<td>'+chgHtml(s.chg, s.days_stale)+'</td>'
       +'<td style="font-weight:600">'+fmtM(mktcap)+'</td>'
       +'<td>'+(s.monto_usd>0?fmtM(s.monto_usd):'—')+'</td>'
       +'<td style="color:var(--muted)">'+(s.ops!=null?s.ops:'—')+'</td>'
@@ -809,6 +883,24 @@ function dpSlice(arr,labels,days) {{
   for(var i=0;i<labels.length;i++) {{ if(labels[i]>=cs) return arr.slice(i); }}
   return arr.slice();
 }}
+// Pads sparse trading data so the X-axis always spans the full calendar range.
+function dpFullRange(rawLabels, days, series) {{
+  if (!rawLabels || !rawLabels.length) return {{labels:[], data:series.map(function(){{return [];}})}};
+  var end   = new Date(rawLabels[rawLabels.length - 1]);
+  var start = days ? (function(){{var d=new Date(end); d.setDate(d.getDate()-days); return d;}})()
+                    : new Date(rawLabels[0]);
+  var idx = {{}};
+  for (var i = 0; i < rawLabels.length; i++) idx[rawLabels[i]] = i;
+  var lo = [];
+  var out = series.map(function(){{return [];}});
+  for (var d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {{
+    var iso = d.toISOString().slice(0, 10);
+    lo.push(iso);
+    var i = idx[iso];
+    for (var s = 0; s < series.length; s++) out[s].push(i !== undefined ? series[s][i] : null);
+  }}
+  return {{labels: lo, data: out}};
+}}
 function openDetail(sym) {{
   dpSym=sym; dpDays=365;
   var s=STOCKS.find(function(x){{return x.sym===sym;}});
@@ -820,8 +912,7 @@ function openDetail(sym) {{
   document.getElementById('dp-pusd').textContent=(s.price_usd!=null?'$'+fmtN(s.price_usd,4)+' USD':'— USD');
   document.getElementById('dp-pbsd').textContent='Bs. '+fmtN(s.price_bsd,2);
   var chg=s.chg, chgEl=document.getElementById('dp-chg');
-  if(chg==null){{chgEl.innerHTML='<span class="pill n">—</span>';}}
-  else {{ var cls=chg>0.05?'g':chg<-0.05?'r':'n'; chgEl.innerHTML='<span class="pill '+cls+'">'+(chg>0?'+':'')+fmtN(chg,2)+'% hoy</span>'; }}
+  chgEl.innerHTML = deltaHtml(chg, {{stale: s.days_stale, suffix: 'hoy'}});
   var kpis=[
     {{label:'Mkt Cap (USD)',       value:fmtM(s.mktcap_usd),            color:s.mktcap_usd>1e9?'var(--accent)':s.mktcap_usd>1e8?'var(--blue)':'var(--text)'}},
     {{label:'Vol. Hoy (USD)',       value:s.monto_usd>0?fmtM(s.monto_usd):'—', color:'var(--text)'}},
@@ -841,10 +932,11 @@ function openDetail(sym) {{
 }}
 function dpBuildCharts(sym,days) {{
   var h=STOCK_HISTORY[sym]; if(!h) return;
-  var labels=dpSlice(h.l,h.l,days);
-  var pof   =dpSlice(h.pof,h.l,days);
-  var ppar  =dpSlice(h.ppar,h.l,days);
-  var vof   =dpSlice(h.vof,h.l,days);
+  var padded = dpFullRange(h.l, days, [h.pof, h.ppar, h.vof]);
+  var labels = padded.labels;
+  var pof    = padded.data[0];
+  var ppar   = padded.data[1];
+  var vof    = padded.data[2];
   var tickCb=function(val,i,ticks){{
     if(ticks.length<=1) return'';
     var step=Math.max(1,Math.floor(labels.length/8));
@@ -854,15 +946,15 @@ function dpBuildCharts(sym,days) {{
   dpPriceChart=new Chart(document.getElementById('dp-price-chart').getContext('2d'),{{
     type:'line',
     data:{{labels:labels,datasets:[
-      {{label:'USD Oficial', data:pof, borderColor:'#58a6ff',borderWidth:2,  pointRadius:0,tension:0.2,fill:false}},
-      {{label:'USD Paralelo',data:ppar,borderColor:'#bc8cff',borderWidth:1.5,pointRadius:0,tension:0.2,fill:false,borderDash:[3,2]}},
+      {{label:'USD Oficial', data:pof, borderColor:'#58a6ff',borderWidth:2,  pointRadius:0,tension:0.2,fill:false,spanGaps:true}},
+      {{label:'USD Paralelo',data:ppar,borderColor:'#bc8cff',borderWidth:1.5,pointRadius:0,tension:0.2,fill:false,borderDash:[3,2],spanGaps:true}},
     ]}},
     options:Object.assign({{}},CHART_DEFAULTS,{{plugins:Object.assign({{}},CHART_DEFAULTS.plugins,{{tooltip:Object.assign({{}},CHART_DEFAULTS.plugins.tooltip,{{callbacks:{{
       title:function(it){{return labels[it[0].dataIndex];}},
       label:function(it){{return it.raw!=null?' '+it.dataset.label+': $'+fmtN(it.raw,4):null;}}
     }}}})}}),
     scales:{{
-      x:{{ticks:{{color:'#8b949e',maxRotation:0,callback:tickCb}},grid:{{color:'#1c2128'}}}},
+      x:{{ticks:{{color:'#8b949e',maxRotation:0,autoSkip:false,callback:tickCb}},grid:{{color:'#1c2128'}}}},
       y:{{ticks:{{color:'#58a6ff',callback:function(v){{return'$'+fmtN(v,2);}}}},grid:{{color:'#1c2128'}}}},
     }}
     }})
@@ -876,7 +968,7 @@ function dpBuildCharts(sym,days) {{
       label:function(it){{return it.raw!=null?' Vol: '+fmtM(it.raw):null;}}
     }}}})}}),
     scales:{{
-      x:{{ticks:{{color:'#8b949e',maxRotation:0,callback:tickCb}},grid:{{color:'#1c2128'}}}},
+      x:{{ticks:{{color:'#8b949e',maxRotation:0,autoSkip:false,callback:tickCb}},grid:{{color:'#1c2128'}}}},
       y:{{ticks:{{color:'#8b949e',callback:function(v){{return fmtM(v);}}}},grid:{{color:'#1c2128'}}}},
     }}
     }})
@@ -953,6 +1045,8 @@ function _liveApply(rows) {
       s.monto_bsd = monto;
       s.monto_usd = rateOf ? monto / rateOf : s.monto_usd;
     }
+    // Ticker showed up in the live feed → traded today, mark fresh.
+    s.days_stale = 0;
     n++;
   }
   return n;
