@@ -1,3 +1,4 @@
+import os
 import re, time, logging, sqlite3, warnings
 import datetime
 from datetime import date
@@ -11,7 +12,8 @@ log = logging.getLogger("bvc")
 
 BASE_URL   = "https://www.bolsadecaracas.com/wp-admin/admin-ajax.php"
 MARKET_URL = "https://market.bolsadecaracas.com/es"
-DB_PATH    = r"C:\Users\miguelperez\Desktop\bvc_database\bvc.db"
+# Resolves relative to this script so it works on Windows AND Linux (CI).
+DB_PATH    = os.environ.get("BVC_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bvc.db"))
 
 HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded",
