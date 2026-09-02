@@ -410,19 +410,30 @@ def sync_today_from_market_website():
     conn = get_conn()
     saved = 0
 
+    # This JSON API returns numbers as plain JS-format strings
+    # ("221.25", ".06", "1195029.16") — '.' is the decimal, no thousands
+    # separator. Don't use clean_number() here (that assumes es-VE format
+    # with '.' as thousands separator and '0.05' would parse as 5). Use
+    # a straight float() with a safe wrapper instead.
+    def _num(v):
+        try:
+            return float(v) if v not in (None, "", "---", "-") else None
+        except (TypeError, ValueError):
+            return None
+
     for r in rows:
         cod_simb = (r.get("COD_SIMB") or "").strip()
         if not cod_simb:
             continue
 
-        precio_cie   = clean_number(r.get("PRECIO"))
+        precio_cie = _num(r.get("PRECIO"))
         if precio_cie is None:
             continue
 
-        var_abs      = clean_number(r.get("VAR_ABS"))
-        var_rel      = clean_number(r.get("VAR_REL"))
-        tot_acciones = clean_number(r.get("VOLUMEN"))
-        tot_monto    = clean_number(r.get("MONTO_EFECTIVO"))
+        var_abs      = _num(r.get("VAR_ABS"))
+        var_rel      = _num(r.get("VAR_REL"))
+        tot_acciones = _num(r.get("VOLUMEN"))
+        tot_monto    = _num(r.get("MONTO_EFECTIVO"))
 
         # This endpoint doesn't return open/high/low/op-count.
         # Preserve any existing values for today so we don't overwrite
