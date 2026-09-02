@@ -1,0 +1,29 @@
+name: Keepalive
+
+# GitHub disables scheduled workflows after 60 days of no human activity.
+# This workflow runs weekly and touches the repo just enough to keep the
+# scheduled workflows (update.yml) alive forever. No PAT needed.
+
+on:
+  # Run every Sunday at 03:00 UTC (well outside market hours)
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gautamkrishnar/keepalive-workflow@v2
+        with:
+          # Amend the last commit's date to now, force-push. Resets GitHub's
+          # inactivity timer without adding empty commits to history.
+          use_api: false
+          committer_username: 'github-actions[bot]'
+          committer_email: 'github-actions[bot]@users.noreply.github.com'
