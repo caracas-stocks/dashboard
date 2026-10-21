@@ -198,9 +198,24 @@ def sync_symbols():
     _log_sync("symbols", count)
 
 
+# Date of the trading session the live feeds are describing, taken from the
+# IBC intraday ticks ("dd/mm/yyyy hh:mm:ss"). On holidays and weekends the
+# feeds keep showing the previous session, so this is how we avoid stamping
+# that old data with today's date. Set by sync_index_data().
+SESSION_DATE = None
+
+
 def sync_index_data():
+    global SESSION_DATE
     log.info("Syncing index data...")
     data = post("chartsData", {"indice": "", "variacion": ""})
+    intraday_dates = []
+    for row in data.get("CUR_IBC", []):
+        m = re.match(r"(\d{2})/(\d{2})/(\d{4})", str(row.get("HORA", "")))
+        if m:
+            intraday_dates.append(f"{m.group(3)}-{m.group(2)}-{m.group(1)}")
+    SESSION_DATE = max(intraday_dates) if intraday_dates else None
+    log.info(f"Current session date (from IBC intraday): {SESSION_DATE}")
     INDEX_MAP = {
         "CUR_IBC":       ("IBC", "intraday"),
         "CUR_FIN":       ("FIN", "intraday"),
@@ -317,9 +332,22 @@ def sync_all_stocks():
         sync_stock_history(sym)
 
 
+def _bcv_fecha_valor(html):
+    """Return the 'Fecha Valor' (YYYY-MM-DD) shown next to the BCV rate.
+
+    From ~3:30 pm the BCV publishes the NEXT business day's rate, so the rate
+    on the page must be stored under its own fecha valor, never under today.
+    """
+    m = re.search(r'Fecha\s*Valor.*?content="(\d{4}-\d{2}-\d{2})', html, re.S | re.I)
+    if not m:
+        m = re.search(r'date-display-single[^>]*content="(\d{4}-\d{2}-\d{2})', html)
+    return m.group(1) if m else None
+
+
 def sync_fx_rates():
     log.info("Syncing exchange rates...")
     usd_val      = None
+    fecha_valor  = None
     paralelo_val = None
     try:
         with warnings.catch_warnings():
@@ -331,6 +359,7 @@ def sync_fx_rates():
             strong = usd_div.find("strong")
             if strong:
                 usd_val = float(strong.text.strip().replace(",", "."))
+        fecha_valor = _bcv_fecha_valor(r.text)
     except Exception as e:
         log.warning(f"BCV scrape failed: {e}")
     try:
@@ -338,22 +367,37 @@ def sync_fx_rates():
         paralelo_val = rp.json().get("promedio")
     except Exception as e:
         log.warning(f"DolarAPI failed: {e}")
-    if usd_val:
-        conn = get_conn()
-        today = date.today().isoformat()
+
+    today = date.today().isoformat()
+    if usd_val and not fecha_valor:
+        # Couldn't read the fecha valor: only trust the page before the cutoff.
+        now = datetime.datetime.now(pytz.timezone("America/Caracas"))
+        if now.weekday() < 5 and (now.hour, now.minute) < (15, 30):
+            fecha_valor = today
+        else:
+            log.warning("BCV fecha valor not found after cutoff; skipping oficial.")
+            usd_val = None
+
+    conn = get_conn()
+    if usd_val and fecha_valor:
         conn.execute("""
-            INSERT INTO exchange_rates (fecha, usd_oficial, usd_paralelo, updated_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO exchange_rates (fecha, usd_oficial, updated_at)
+            VALUES (?, ?, ?)
             ON CONFLICT(fecha) DO UPDATE SET
-                usd_oficial=excluded.usd_oficial,
-                usd_paralelo=COALESCE(excluded.usd_paralelo, exchange_rates.usd_paralelo),
-                updated_at=excluded.updated_at
-        """, (today, usd_val, paralelo_val, now_utc()))
-        conn.commit()
-        conn.close()
-        log.info(f"FX rates saved: oficial={usd_val}, paralelo={paralelo_val}")
-    else:
-        log.warning("Could not retrieve FX rates today.")
+                usd_oficial=excluded.usd_oficial, updated_at=excluded.updated_at
+        """, (fecha_valor, usd_val, now_utc()))
+        log.info(f"BCV oficial {usd_val} saved for fecha valor {fecha_valor}")
+    if paralelo_val:
+        conn.execute("""
+            INSERT INTO exchange_rates (fecha, usd_paralelo, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(fecha) DO UPDATE SET
+                usd_paralelo=excluded.usd_paralelo, updated_at=excluded.updated_at
+        """, (today, paralelo_val, now_utc()))
+    conn.commit()
+    conn.close()
+    if not usd_val:
+        log.warning("Could not retrieve the BCV rate this run.")
     _log_sync("fx_rates", 1 if usd_val else 0)
 
 
@@ -407,6 +451,12 @@ def sync_today_from_market_website():
         return
 
     fecha_today = date.today().isoformat()
+    # On holidays the feed keeps listing the previous session. Only write
+    # when the IBC intraday ticks confirm that today's session exists.
+    if SESSION_DATE != fecha_today:
+        log.info(f"No session today (last intraday session: {SESSION_DATE}); "
+                 "live prices not saved.")
+        return
     conn = get_conn()
     saved = 0
 
@@ -435,6 +485,22 @@ def sync_today_from_market_website():
         tot_acciones = _num(r.get("VOLUMEN"))
         tot_monto    = _num(r.get("MONTO_EFECTIVO"))
 
+        # No volume → it didn't trade today.
+        if not ((tot_acciones or 0) > 0 or (tot_monto or 0) > 0):
+            continue
+        # "Echo": the feed sometimes lists a ticker with its last old trade
+        # (same price, shares and amount as its previous row). Skip it.
+        last = conn.execute(
+            "SELECT precio_cie, tot_acciones, tot_monto FROM stock_daily "
+            "WHERE cod_simb=? AND fecha<? ORDER BY fecha DESC LIMIT 1",
+            (cod_simb, fecha_today),
+        ).fetchone()
+        if (last and last[0] == precio_cie
+                and (last[1] or 0) == (tot_acciones or 0)
+                and abs((last[2] or 0) - (tot_monto or 0)) < 0.01):
+            log.info(f"{cod_simb}: skipping echo of previous trade")
+            continue
+
         # This endpoint doesn't return open/high/low/op-count.
         # Preserve any existing values for today so we don't overwrite
         # richer data captured by sync_stock_history the next morning.
@@ -444,10 +510,15 @@ def sync_today_from_market_website():
             (cod_simb, fecha_today),
         ).fetchone()
 
+        # If the official history already has today's row (it carries an
+        # operation count), it wins: never overwrite it with live-feed figures.
+        if existing and existing["tot_operaciones"] is not None:
+            continue
+
         precio_apert    = existing["precio_apert"]    if existing else None
         precio_max      = existing["precio_max"]      if existing else None
         precio_min      = existing["precio_min"]      if existing else None
-        tot_operaciones = existing["tot_operaciones"] if existing else None
+        tot_operaciones = None
 
         conn.execute("""
             INSERT OR REPLACE INTO stock_daily

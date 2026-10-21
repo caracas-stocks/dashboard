@@ -54,6 +54,14 @@ jobs:
         run: python load_parallel_rates.py
         continue-on-error: true
 
+      - name: Load official BVC market reports (daily closes + weekly bulletins)
+        run: python load_market_reports.py
+        continue-on-error: true
+
+      - name: Data quality and DB size maintenance
+        run: python maintenance.py
+        continue-on-error: true
+
       - name: Rebuild dashboard HTML
         run: |
           python build_dashboard.py
