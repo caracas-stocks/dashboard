@@ -209,10 +209,14 @@ for r in stocks_raw:
 
     days_stale = _days_between(r["fecha"], market_last_day) if market_last_day else 0
 
-    # Var 1D%: only meaningful if the stock actually traded on the market's
-    # most recent trading day. If it didn't trade, its 1D change is 0.
+    # Var 1D%, Vol. Día and Ops. only describe the market's most recent
+    # session. If the stock didn't trade that day, all three are 0 — we
+    # never carry over figures from an older trade date.
+    ops = r["tot_operaciones"]
     if days_stale > 0:
         chg = 0.0
+        m   = 0
+        ops = 0
     else:
         prev = r["prev_close"]
         chg  = round((p / prev - 1) * 100, 2) if (p and prev and prev > 0) else None
@@ -225,7 +229,7 @@ for r in stocks_raw:
         "price_usd":     round(p/of, 4) if of else None,
         "price_usd_par": round(p/par, 4) if par else None,
         "chg": chg,
-        "ops": r["tot_operaciones"],
+        "ops": ops,
         "monto_bsd": round(m, 2),
         "monto_usd": round(m/of, 2) if (of and m) else 0,
         "mktcap_usd":     round(mktcap_of,  0),
@@ -659,6 +663,12 @@ function fmtM(v) {{
   if (v >= 1e3) return '$' + (v/1e3).toFixed(0) + 'K';
   return '$' + v.toFixed(0);
 }}
+// Daily volume: 0 means "no trades in the last session" and is shown as $0.
+function fmtVol(v) {{
+  if (v == null || isNaN(v)) return '—';
+  if (v === 0) return '$0';
+  return fmtM(v);
+}}
 // Unified delta format used across KPIs, table and detail overlay.
 // Matches the Python delta_html() so nothing looks out of place.
 function deltaHtml(v, opts) {{
@@ -868,7 +878,7 @@ function renderTable() {{
       +'<td>'+fmtN(s.price_bsd,2)+'</td>'
       +'<td>'+chgHtml(s.chg, s.days_stale)+'</td>'
       +'<td style="font-weight:600">'+fmtM(mktcap)+'</td>'
-      +'<td>'+(s.monto_usd>0?fmtM(s.monto_usd):'—')+'</td>'
+      +'<td'+(s.monto_usd>0?'':' style="color:var(--muted)"')+'>'+fmtVol(s.monto_usd)+'</td>'
       +'<td style="color:var(--muted)">'+(s.ops!=null?s.ops:'—')+'</td>'
       +'<td><span class="bar" style="width:'+barW+'px;background:'+barC+'"></span></td>'
       +'</tr>';
@@ -915,7 +925,7 @@ function openDetail(sym) {{
   chgEl.innerHTML = deltaHtml(chg, {{stale: s.days_stale, suffix: 'hoy'}});
   var kpis=[
     {{label:'Mkt Cap (USD)',       value:fmtM(s.mktcap_usd),            color:s.mktcap_usd>1e9?'var(--accent)':s.mktcap_usd>1e8?'var(--blue)':'var(--text)'}},
-    {{label:'Vol. Hoy (USD)',       value:s.monto_usd>0?fmtM(s.monto_usd):'—', color:'var(--text)'}},
+    {{label:'Vol. Hoy (USD)',       value:fmtVol(s.monto_usd),            color:s.monto_usd>0?'var(--text)':'var(--muted)'}},
     {{label:'Ops. Hoy',            value:s.ops!=null?s.ops:'—',          color:'var(--text)'}},
     {{label:'Máx 52 Sem.',         value:st.h52!=null?'$'+fmtN(st.h52,4):'—', color:'var(--green)'}},
     {{label:'Mín 52 Sem.',         value:st.l52!=null?'$'+fmtN(st.l52,4):'—', color:'var(--red)'}},
@@ -1005,6 +1015,7 @@ LIVE_JS = """
 // ── Live refresh via Cloudflare Worker (CORS proxy for BVC API) ─────────────
 const LIVE_REFRESH_MS = 30000;
 const PROXY_URL = 'https://bvc-proxy.miguelperezb-14.workers.dev/wp-admin/admin-ajax.php';
+const MARKET_LAST_DAY = '__MARKET_LAST_DAY__';  // last session in the DB at build time
 
 async function _liveFetch() {
   try {
@@ -1022,6 +1033,12 @@ function _liveApply(rows) {
   const rateOf  = FX_OF[FX_OF.length - 1]   || 0;
   const ratePar = FX_PAR[FX_PAR.length - 1] || 0;
   if (!rateOf) return 0;
+  // The feed is empty before the open and only lists tickers traded in the
+  // current session. If it's a new session vs. the build (today > last day
+  // in the DB), anything NOT in the feed hasn't traded today → 1D, Vol, Ops = 0.
+  const todayVET   = new Date().toLocaleDateString('en-CA', {timeZone: 'America/Caracas'});
+  const newSession = todayVET > MARKET_LAST_DAY;
+  const traded = new Set();
   let n = 0;
   for (const row of rows) {
     const sym = (row.COD_SIMB || '').trim();
@@ -1031,6 +1048,12 @@ function _liveApply(rows) {
     const price = parseFloat(row.PRECIO);
     const chg   = parseFloat(row.VAR_REL);
     const monto = parseFloat(row.MONTO_EFECTIVO);
+    const vol   = parseFloat(row.VOLUMEN);
+    // No volume → no trade today; leave the row as built.
+    if (!((isFinite(vol) && vol > 0) || (isFinite(monto) && monto > 0))) continue;
+    traded.add(sym);
+    // Ops of the previous session don't apply to today's trades (feed has no op count).
+    if (newSession) s.ops = null;
     if (isFinite(price)) {
       s.price_bsd     = price;
       s.price_usd     = rateOf  ? price / rateOf  : s.price_usd;
@@ -1048,6 +1071,13 @@ function _liveApply(rows) {
     // Ticker showed up in the live feed → traded today, mark fresh.
     s.days_stale = 0;
     n++;
+  }
+  if (newSession && traded.size > 0) {
+    for (const s of STOCKS) {
+      if (traded.has(s.sym)) continue;
+      s.chg = 0; s.monto_bsd = 0; s.monto_usd = 0; s.ops = 0;
+      s.days_stale = Math.max(s.days_stale || 0, 1);
+    }
   }
   return n;
 }
@@ -1078,6 +1108,7 @@ setInterval(_liveTick, LIVE_REFRESH_MS);
 """
 
 # Insert LIVE_JS right before the closing </script>. There should be exactly one.
+LIVE_JS = LIVE_JS.replace('__MARKET_LAST_DAY__', market_last_day or '')
 html = html.replace('</script>\n</body>', LIVE_JS + '</script>\n</body>', 1)
 
 with open(OUT_PATH, "w", encoding="utf-8") as f:
