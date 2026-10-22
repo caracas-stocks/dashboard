@@ -147,21 +147,15 @@ if session_date:
 
 # ── Stocks ────────────────────────────────────────────────────────────────────
 symbols = {x["cod_simb"]: x for x in q("SELECT * FROM symbols WHERE market_type='RV'")}
+# Shares outstanding as change points [[first date seen, shares], ...]. The
+# BVC updates this figure on its own schedule, sometimes days after the price
+# already reflects a split, so the dates get corrected below with the price
+# evidence (see shares_timeline).
 shares_hist = {}
 for x in q("SELECT cod_simb, fecha, acc_circ FROM shares_history WHERE acc_circ>0 ORDER BY cod_simb, fecha"):
-    shares_hist.setdefault(x["cod_simb"], []).append((x["fecha"], x["acc_circ"]))
-
-
-def shares_at(sym, fecha):
-    """Shares outstanding as of `fecha` — so a stale price is never multiplied
-    by a share count that changed afterwards (e.g. a suspended consolidation)."""
-    h = shares_hist.get(sym)
-    if h:
-        i = bisect_right([f for f, _ in h], fecha) - 1
-        if i >= 0:
-            return h[i][1]
-        return h[0][1]
-    return symbols[sym]["acc_circ"]
+    pts = shares_hist.setdefault(x["cod_simb"], [])
+    if not pts or pts[-1][1] != x["acc_circ"]:
+        pts.append([x["fecha"], x["acc_circ"]])
 
 
 raw = {}
@@ -177,12 +171,14 @@ for x in q("""SELECT sd.cod_simb, sd.fecha, sd.precio_cie, sd.tot_operaciones,
         {"f": x["fecha"], "p": p, "m": m, "ops": x["tot_operaciones"], "live": x["tot_operaciones"] is None})
 
 
-def adjusted_prices(sym, rows):
-    """Prices adjusted for splits/consolidations, plus one-day bad prints removed.
+def detect_events(sym, rows):
+    """Corporate events (splits / consolidations) and one-day bad prints.
 
     Event = a share-count change of >1.5x that lines up (within ~10 trades)
     with a price jump of roughly the inverse size, or a persistent price jump
     of more than 20x with no share data (old nominal-value restructurings).
+    Each event: {"i": index of the first trade after it, "ratio": new/old
+    shares, "j": index of the matching shares change point or None}.
     """
     prices = [x["p"] for x in rows]
     dates = [x["f"] for x in rows]
@@ -192,34 +188,72 @@ def adjusted_prices(sym, rows):
         a, b, c = prices[i - 1], prices[i], prices[i + 1]
         if (b / a > 4 and c / b < 0.25) or (b / a < 0.25 and c / b > 4):
             keep[i] = False
-    factors = [1.0] * n
     events = []
     h = shares_hist.get(sym, [])
     for j in range(1, len(h)):
         ratio = h[j][1] / h[j - 1][1]
         if 0.67 < ratio < 1.5:
             continue
-        k = bisect_right(dates, h[j][0])          # first trade on/after the change
+        k = bisect_right(dates, h[j][0])          # first trade after the change was seen
         for i in range(max(1, k - 10), min(n, k + 3)):
             pr = prices[i] / prices[i - 1]
             if keep[i] and keep[i - 1] and 0.65 < pr * ratio < 1.35:
-                events.append((i, ratio)); break
+                events.append({"i": i, "ratio": ratio, "j": j}); break
     for i in range(1, n):
         if not (keep[i] and keep[i - 1]):
             continue
         pr = prices[i] / prices[i - 1]
-        if (pr > 20 or pr < 0.05) and not any(e[0] == i for e in events):
+        if (pr > 20 or pr < 0.05) and not any(e["i"] == i for e in events):
             nxt = prices[i + 1:i + 4]
             if nxt and all(0.5 < v / prices[i] < 2 for v in nxt):
-                events.append((i, 1 / pr))
-    for i, ratio in events:                       # divide earlier prices by the ratio
-        for t in range(i):
-            factors[t] /= ratio
-    adj = [prices[t] * factors[t] if keep[t] else None for t in range(n)]
-    return adj, [(dates[i], round(rt, 4)) for i, rt in events]
+                events.append({"i": i, "ratio": 1 / pr, "j": None})
+    return keep, events
 
 
-stocks, hist, stats, corp_events = [], {}, {}, {}
+def adjusted_prices(rows, keep, events):
+    """Prices restated on today's share basis (earlier prices ÷ event ratio)."""
+    n = len(rows)
+    factors = [1.0] * n
+    for e in events:
+        for t in range(e["i"]):
+            factors[t] /= e["ratio"]
+    return [rows[t]["p"] * factors[t] if keep[t] else None for t in range(n)]
+
+
+def shares_timeline(sym, rows, events):
+    """Return (shares_at(date), shares_now).
+
+    Starts from the observed change points and moves each split to the day the
+    price actually reflected it. Before the first observation, price-only
+    events are undone backwards so market cap stays continuous.
+    """
+    pts = [list(p) for p in shares_hist.get(sym, [])]
+    dates = [x["f"] for x in rows]
+    for e in events:
+        j = e["j"]
+        if j is None:
+            continue
+        d = dates[e["i"]]
+        if d < pts[j][0] and d > pts[j - 1][0]:
+            pts[j][0] = d
+    now = pts[-1][1] if pts else symbols[sym]["acc_circ"]
+    first = pts[0][0] if pts else "9999-12-31"
+    pre = [(dates[e["i"]], e["ratio"]) for e in events if e["j"] is None]
+    pdates = [p[0] for p in pts]
+
+    def at(d):
+        i = bisect_right(pdates, d) - 1
+        if i >= 0:
+            return pts[i][1]
+        s = pts[0][1] if pts else now
+        for ed, ratio in pre:
+            if d < ed <= first:
+                s /= ratio
+        return s
+    return at, now
+
+
+stocks, hist, stats, corp_events, SHARES = [], {}, {}, {}, {}
 for sym, rows in raw.items():
     if sym not in symbols:
         continue
@@ -227,11 +261,14 @@ for sym, rows in raw.items():
     prev = rows[-2] if len(rows) > 1 else None
     stale = last["f"] != session_date
     o, p_ = of_at(last["f"]), par_at(last["f"])
-    sh = shares_at(sym, last["f"])
+    keep, ev = detect_events(sym, rows)
+    adj = adjusted_prices(rows, keep, ev)
+    shares_at_fn, shares_now = shares_timeline(sym, rows, ev)
+    SHARES[sym] = (shares_at_fn, keep)
+    sh = shares_at_fn(last["f"])                 # shares in force on the last trade
     price = last["p"]
-    adj, ev = adjusted_prices(sym, rows)
     if ev:
-        corp_events[sym] = ev
+        corp_events[sym] = [(rows[e["i"]]["f"], round(e["ratio"], 4)) for e in ev]
     # 1D change vs previous trade, split-adjusted. 0 if it didn't trade.
     if stale:
         chg = 0.0
@@ -239,14 +276,16 @@ for sym, rows in raw.items():
         chg = round((adj[-1] / adj[-2] - 1) * 100, 2)
     else:
         chg = None
-    h = {"l": [], "pb": [], "pof": [], "ppar": [], "vof": []}
-    for x, a in zip(rows, adj):
+    h = {"l": [], "pb": [], "pof": [], "ppar": [], "vof": [], "cap": []}
+    for x, a, k in zip(rows, adj, keep):
         oo, pp = of_at(x["f"]), par_at(x["f"])
         h["l"].append(x["f"])
         h["pb"].append(r(a, 2))
         h["pof"].append(r(a / oo) if (a and oo) else None)
         h["ppar"].append(r(a / pp) if (a and pp) else None)
         h["vof"].append(round(x["m"] / oo) if (x["m"] and oo) else None)
+        shx = shares_at_fn(x["f"])
+        h["cap"].append(round(x["p"] * shx / oo) if (k and oo and shx) else None)
     hist[sym] = h
     last252 = [v for v in h["pof"][-252:] if v]
     vols = [v for v in h["vof"][-252:] if v]
@@ -266,6 +305,7 @@ for sym, rows in raw.items():
         "monto_bsd": 0 if stale else round(last["m"], 2),
         "monto_usd": 0 if stale else (round(last["m"] / o, 2) if o else 0),
         "shares": sh,
+        "shares_now": shares_now,                # for live prices traded after a share change
         "mktcap_usd": round(price * sh / o) if (o and sh) else None,
         "mktcap_usd_par": round(price * sh / p_) if (p_ and sh) else None,
         "spark": spark,
@@ -273,30 +313,54 @@ for sym, rows in raw.items():
 stocks.sort(key=lambda x: x["mktcap_usd"] or 0, reverse=True)
 
 
+# Daily total market cap: each stock's last valid price on or before the day,
+# times the shares in force on that price's date, at that day's exchange rate.
+_valid = {}
+for sym, rows in raw.items():
+    if sym in SHARES:
+        at, keep = SHARES[sym]
+        vr = [(x["f"], x["p"]) for x, k in zip(rows, keep) if k]
+        _valid[sym] = ([f for f, _ in vr], [p for _, p in vr], at)
+
+
 def cap_on(fecha):
-    """Total RV market cap (USD oficial and paralelo) as of a session date."""
+    """Total RV market cap (USD BCV, USD paralelo) and its components."""
+    o, p_ = of_at(fecha), par_at(fecha)
     tot_o = tot_p = 0.0
-    for sym, rows in raw.items():
-        if sym not in symbols:
-            continue
-        ds = [x["f"] for x in rows]
+    for sym, (ds, ps, at) in _valid.items():
         i = bisect_right(ds, fecha) - 1
         if i < 0:
             continue
-        x = rows[i]
-        sh = shares_at(sym, x["f"])
-        o, p_ = of_at(fecha), par_at(fecha)
-        if sh and o:
-            tot_o += x["p"] * sh / o
-        if sh and p_:
-            tot_p += x["p"] * sh / p_
+        v = ps[i] * (at(ds[i]) or 0)
+        if o:
+            tot_o += v / o
+        if p_:
+            tot_p += v / p_
     return tot_o, tot_p
 
 
 cap_of = sum(s["mktcap_usd"] or 0 for s in stocks)
 cap_par = sum(s["mktcap_usd_par"] or 0 for s in stocks)
 cap_prev_of = cap_on(prev_session)[0] if prev_session else None
-cap_series = [[d, round(cap_on(d)[0])] for d in rv_days[-60:]]
+cap_hist = [[d] + [round(v) for v in cap_on(d)] for d in rv_days if d >= "2025-01-01"]
+cap_series = [[d, c] for d, c, _ in cap_hist[-60:]]
+
+# Same history split into the 6 largest companies today + the rest (USD BCV).
+TOP_N = 6
+top_syms = [s["sym"] for s in stocks if s["mktcap_usd"]][:TOP_N]
+
+
+def stock_cap_on(sym, fecha):
+    ds, ps, at = _valid.get(sym, ([], [], None))
+    i = bisect_right(ds, fecha) - 1
+    o = of_at(fecha)
+    return ps[i] * (at(ds[i]) or 0) / o if (i >= 0 and o) else 0.0
+
+
+cap_top = {"syms": top_syms, "rows": []}
+for d, tot_o, _ in cap_hist:
+    parts = [round(stock_cap_on(sym, d)) for sym in top_syms]
+    cap_top["rows"].append([d] + parts + [max(0, tot_o - sum(parts))])
 
 # ── Volume ────────────────────────────────────────────────────────────────────
 vol_by_day = {}
@@ -412,7 +476,7 @@ data = {
         "n_stocks": len(stocks), "n_traded": sum(1 for s in stocks if not s["stale"]),
     },
     "series": {"ibc": ibc_series, "fx": fx_series, "vol_rv": vol_rv, "weekly": vol_weekly,
-               "cap": cap_series, "intraday": intraday},
+               "cap": cap_series, "cap_hist": cap_hist, "cap_top": cap_top, "intraday": intraday},
     "stocks": stocks, "hist": hist, "stats": stats, "events": corp_events,
 }
 

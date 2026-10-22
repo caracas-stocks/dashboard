@@ -168,6 +168,16 @@ footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;gap:16px;f
     </div>
   </section>
 
+  <section class="card full">
+    <div class="hd">
+      <h2>Capitalización bursátil histórica</h2>
+      <div class="sp"></div>
+      <div class="seg" id="capMode"><button data-v="usd" class="on">USD</button><button data-v="top">Por acción</button></div>
+    </div>
+    <div class="hd" style="margin-top:-6px"><span class="hint" id="capSub"></span><div class="sp"></div><div class="seg" id="capRng"></div></div>
+    <div class="chart"><canvas id="capChart"></canvas></div>
+  </section>
+
   <section class="grid row2b">
     <div class="card">
       <div class="hd"><h2>Volumen de renta variable</h2><div class="sp"></div><span class="hint">Semanal · USD al BCV</span></div>
@@ -417,6 +427,38 @@ function drawFX() {
   });
 }
 
+// ── market cap history ───────────────────────────────────────────────────────
+let capChart, capMode = 'usd', capRange = 365;
+const CAPC = ['#5B8CFF', '#F59E0B', '#14B8A6', '#EC4899', '#7C5CFF', '#22C55E'];
+function drawCap() {
+  const all = S.cap_hist; if (!all || !all.length) return;
+  const c0 = cutoff(all[all.length - 1][0], capRange);
+  let datasets, labels, sub;
+  if (capMode === 'usd') {
+    const rows = all.filter(r => r[0] >= c0); labels = rows.map(r => r[0]);
+    const a = rows.map(r => r[1]), b = rows.map(r => r[2]);
+    datasets = [
+      {label: 'USD BCV', data: a, borderColor: '#5B8CFF', borderWidth: 2, pointRadius: 0, tension: .2, fill: true, backgroundColor: (ctx) => areaFill(ctx, '#5B8CFF'), pointStyle: 'line'},
+      {label: 'USD paralelo', data: b, borderColor: '#F59E0B', borderWidth: 2, borderDash: [5, 4], pointRadius: 0, tension: .2, spanGaps: true, pointStyle: 'line'}];
+    sub = `Hoy ${usd(K.cap_of)} al BCV · ${usd(K.cap_par)} al paralelo · en el período: BCV ${arrow(chgTxt(a))} · paralelo ${arrow(chgTxt(b))}`;
+  } else {
+    const T = S.cap_top, rows = T.rows.filter(r => r[0] >= c0); labels = rows.map(r => r[0]);
+    datasets = T.syms.map((sym, k) => ({label: sym, data: rows.map(r => r[k + 1]), backgroundColor: CAPC[k] + 'B3', borderColor: CAPC[k], borderWidth: 1, pointRadius: 0, fill: true, tension: .2, stack: 'cap', pointStyle: 'rect'}));
+    datasets.push({label: 'Resto', data: rows.map(r => r[T.syms.length + 1]), backgroundColor: '#47556999', borderColor: '#64748B', borderWidth: 1, pointRadius: 0, fill: true, tension: .2, stack: 'cap', pointStyle: 'rect'});
+    const last = rows[rows.length - 1], tot = last ? last.slice(1).reduce((x, y) => x + y, 0) : 0;
+    sub = `USD al BCV · las ${T.syms.length} mayores suman ${fmt(tot ? T.syms.reduce((x, _, k) => x + last[k + 1], 0) / tot * 100 : 0, 1)}% del mercado`;
+  }
+  document.getElementById('capSub').innerHTML = sub;
+  if (capChart) capChart.destroy();
+  capChart = new Chart(document.getElementById('capChart'), {
+    type: 'line', data: {labels, datasets},
+    options: {responsive: true, maintainAspectRatio: false, animation: false, interaction: {mode: 'index', intersect: false},
+      plugins: {legend: {...LEG, labels: {...LEG.labels, boxWidth: capMode === 'usd' ? 18 : 10, boxHeight: capMode === 'usd' ? 12 : 10}}, tooltip: {...TT, callbacks: {title: (it) => fdate(labels[it[0].dataIndex]), label: (it) => it.raw == null ? null : ` ${it.dataset.label}: ${usd(it.raw)}`,
+        footer: (it) => capMode === 'top' ? `Total: ${usd(it.reduce((a, x) => a + (x.raw || 0), 0))}` : ''}}},
+      scales: {x: {grid: {display: false}, ticks: xTicks(labels)}, y: {stacked: capMode === 'top', position: 'right', ticks: {callback: (v) => usd(v)}}}}
+  });
+}
+
 // Weekly volume rows: [monday, last day, rv_usd, rf_usd, ob_usd, total_usd, rv_bsd, rf_bsd, ob_bsd, total_bsd]
 function weekBars(canvasId, col, colBs, color, label) {
   const rows = S.weekly.filter(r => r[col] != null);
@@ -581,6 +623,8 @@ function openDetail(sym) {
     </div>
     <div class="hd" style="display:flex;align-items:center;margin-top:6px"><h2 style="font-size:14px">Precio en USD</h2><div style="margin-left:auto" class="seg" id="dRng"></div></div>
     <div class="chart sm"><canvas id="dPrice"></canvas></div>
+    <h2 style="font-size:14px;margin:18px 0 10px">Capitalización (USD al BCV)</h2>
+    <div class="chart" style="height:200px"><canvas id="dCap"></canvas></div>
     <h2 style="font-size:14px;margin:18px 0 10px">Volumen diario (USD al BCV)</h2>
     <div class="chart" style="height:170px"><canvas id="dVol"></canvas></div>
     ${ev ? `<div class="note">Precios históricos ajustados por ${ev.length > 1 ? 'eventos corporativos' : 'un evento corporativo'} (${ev.map(e => fdate(e[0]) + ', ' + (e[1] >= 1 ? 'división ×' + fmt(e[1], 2) : 'consolidación ÷' + fmt(1 / e[1], 0))).join('; ')}). La capitalización usa las acciones vigentes a la fecha de la última operación.</div>` : ''}`;
@@ -593,8 +637,13 @@ function drawDetail() {
   const h = D.hist[dSym]; if (!h) return;
   dCharts.forEach(c => c.destroy()); dCharts = [];
   const days = dRange === 'ytd' ? Math.round((new Date(h.l[h.l.length - 1]) - new Date(META.year + '-01-01')) / 864e5) : dRange;
-  const P = fullRange(h.l, days, [h.pof, h.ppar, h.vof]);
+  const P = fullRange(h.l, days, [h.pof, h.ppar, h.vof, h.cap || []]);
   const labels = P.labels;
+  dCharts.push(new Chart(document.getElementById('dCap'), {type: 'line',
+    data: {labels, datasets: [{label: 'Capitalización', data: P.data[3], borderColor: '#14B8A6', borderWidth: 2, pointRadius: 0, spanGaps: true, tension: .2, fill: true, backgroundColor: (ctx) => areaFill(ctx, '#14B8A6')}]},
+    options: {responsive: true, maintainAspectRatio: false, animation: false, interaction: {mode: 'index', intersect: false},
+      plugins: {legend: {display: false}, tooltip: {...TT, displayColors: false, callbacks: {title: (it) => fdate(labels[it[0].dataIndex]), label: (it) => it.raw == null ? null : ' ' + usd(it.raw)}}},
+      scales: {x: {grid: {display: false}, ticks: xTicks(labels)}, y: {position: 'right', ticks: {callback: (v) => usd(v)}}}}}));
   dCharts.push(new Chart(document.getElementById('dPrice'), {type: 'line',
     data: {labels, datasets: [
       {label: 'BCV', data: P.data[0], borderColor: '#5B8CFF', borderWidth: 2, pointRadius: 0, spanGaps: true, tension: .2, fill: true, backgroundColor: (ctx) => areaFill(ctx, '#5B8CFF'), pointStyle: 'line'},
@@ -630,8 +679,14 @@ async function liveTick() {
     if (!((vol > 0) || (monto > 0))) continue;
     if (s.stale && price === s.price_bsd && !(Math.abs(chg) > 0)) continue;   // echo of an old trade
     traded.add(s.sym);
+    // A live trade happens today, after any share change: use today's share
+    // count. Guard: a price that moved >5x with no known share change means a
+    // corporate event the build hasn't seen yet — keep the built market cap.
+    const shNow = s.shares_now || s.shares;
+    const jump = s.price_bsd ? price / s.price_bsd : 1;
+    const unexplained = (jump > 5 || jump < 0.2) && shNow === s.shares;
     s.price_bsd = price; s.price_usd = price / of; s.price_usd_par = price / par;
-    if (s.shares) { s.mktcap_usd = price * s.shares / of; s.mktcap_usd_par = price * s.shares / par; }
+    if (shNow && !unexplained) { s.shares = shNow; s.mktcap_usd = price * shNow / of; s.mktcap_usd_par = price * shNow / par; }
     if (isFinite(chg)) s.chg = chg;
     if (isFinite(monto)) { s.monto_bsd = monto; s.monto_usd = monto / of; }
     if (newSession) s.ops = null;
@@ -654,10 +709,12 @@ rangeSeg('ibcRng', 365, (v) => { ibcRange = v; drawIBC(); });
 rangeSeg('fxRng', 365, (v) => { fxRange = v; drawFX(); });
 segCtl('ibcCur', (v) => { ibcCur = v; drawIBC(); });
 segCtl('fxMode', (v) => { fxMode = v; drawFX(); });
+segCtl('capMode', (v) => { capMode = v; drawCap(); });
+rangeSeg('capRng', 365, (v) => { capRange = v; drawCap(); });
 segCtl('rfMode', (v) => { rfMode = v; drawRF(); });
 segCtl('tmMode', (v) => { tmMode = v; renderHeatmap(); });
 segCtl('ccy', (v) => { ccy = v; renderTable(); });
-drawIBC(); drawFX(); drawRV(); drawRF(); renderHeatmap();
+drawIBC(); drawFX(); drawCap(); drawRV(); drawRF(); renderHeatmap();
 window.addEventListener('resize', () => { clearTimeout(window._rz); window._rz = setTimeout(renderHeatmap, 150); });
 document.getElementById('foot').textContent = `Generado ${new Date(META.built_utc).toLocaleString('es-VE', {timeZone: 'America/Caracas'})} (hora de Caracas)`;
 setInterval(renderStatus, 60000);
