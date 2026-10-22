@@ -1,11 +1,12 @@
 name: Update BVC Dashboard
 
 on:
-  # Every 5 minutes during Caracas market hours, Mon-Fri
-  # VET 09:00-13:15 = UTC 13:00-17:15
+  # Main trigger: the Cloudflare Worker bvc-scheduler calls workflow_dispatch
+  # every 5 minutes in market hours (cloudflare/bvc-scheduler.js).
+  # GitHub's own schedule stays only as a best-effort backup.
   schedule:
     - cron: '*/5 13-17 * * 1-5'
-  # Manual trigger from the Actions tab
+  # Cloudflare scheduler + manual trigger from the Actions tab
   workflow_dispatch:
 
 # Allow the workflow to commit back to the repo
@@ -25,13 +26,16 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
-          # Need full history so we can commit and push
+          # Latest main, not the commit that was current when the run was
+          # queued: runs wait for each other (concurrency), so the previous
+          # run's commit must be the starting point or the push is rejected.
+          ref: main
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -77,7 +81,15 @@ jobs:
             echo "No changes to commit."
           else
             git commit -m "data: auto-update $(date -u +'%Y-%m-%d %H:%MZ')"
-            git push
+            # If main moved meanwhile (e.g. a manual push), replay this run's
+            # commit on top, keeping this run's freshly built files.
+            for attempt in 1 2 3; do
+              if git push; then exit 0; fi
+              echo "Push rejected, rebasing on latest main (attempt $attempt)"
+              git fetch --depth=20 origin main
+              git rebase -X theirs origin/main || { git rebase --abort; exit 1; }
+            done
+            exit 1
           fi
 
   deploy-pages:
@@ -88,18 +100,18 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout (post-update)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: main
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: '.'
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
