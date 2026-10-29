@@ -378,11 +378,19 @@ last_official = max(official) if official else "0000"
 
 # Renta variable per day, split into mercado regular and mercado a plazo
 # (forward/financing operations — they can be 10–100x the regular market).
+# The posts sometimes misstate the total (5 and 8 Sep 2025, 9 Mar 2026: the
+# total is smaller than regular + plazo, and the weekly summary confirms the
+# components), so when both components are there they win over the total.
 rv_bsd_day, plazo_bsd_day = {}, {}
 for f, v in official.items():
-    if v["rv_total"] is not None:
-        rv_bsd_day[f] = v["rv_total"]
-        plazo_bsd_day[f] = v["rv_plazo"] or (v["rv_total"] - v["rv_regular"] if v["rv_regular"] is not None else 0)
+    reg, pla, tot = v["rv_regular"], v["rv_plazo"], v["rv_total"]
+    if reg is not None and pla is not None:
+        comp = reg + pla
+        tot = tot if (tot is not None and abs(tot - comp) <= 0.02 * max(tot, comp)) else comp
+    if tot is None:
+        continue
+    rv_bsd_day[f] = tot
+    plazo_bsd_day[f] = pla if pla is not None else (max(0.0, tot - reg) if reg is not None else 0.0)
 for f, v in vol_by_day.items():
     if f > last_official:          # not reported yet: our own regular-market sum
         rv_bsd_day[f] = v
@@ -409,36 +417,54 @@ def monday(iso):
 
 
 # Weekly volume by market: renta variable, renta fija and otros bienes
-# (CFB). Otros bienes = weekly bulletin total − RV − RF; when the bulletin is
-# missing, fall back to the daily otros-bienes figures if they were reported.
+# (CFB). Weeks with a bulletin: otros bienes = bulletin total − RV − RF.
+# Weeks without one yet (the week in progress): the CFB trades themselves
+# (load_otros_bienes.py), and the total is RV + RF + otros bienes so far.
 weeks = {}
-blank = lambda f: {"rv": 0.0, "pla": 0.0, "rf": 0.0, "ob": 0.0, "fin": f}
+blank = lambda f: {"rv": 0.0, "pla": 0.0, "rf": 0.0, "ob": 0.0, "cfb": 0.0, "fin": f}
 for f, v in rv_bsd_day.items():
     w = weeks.setdefault(monday(f), blank(f))
     w["rv"] += v; w["pla"] += plazo_bsd_day.get(f, 0.0); w["fin"] = max(w["fin"], f)
 for f, x in official.items():
     w = weeks.setdefault(monday(f), blank(f))
     w["rf"] += x["rf"] or 0; w["ob"] += x["otros_bienes"] or 0; w["fin"] = max(w["fin"], f)
+cfb_from = None
+if table_exists("cfb_daily"):
+    for x in q("SELECT fecha, SUM(monto_bsd) AS m FROM cfb_daily WHERE monto_bsd > 0 GROUP BY fecha"):
+        w = weeks.setdefault(monday(x["fecha"]), blank(x["fecha"]))
+        w["cfb"] += x["m"]; w["fin"] = max(w["fin"], x["fecha"])
+        cfb_from = min(cfb_from or x["fecha"], x["fecha"])
 bulletins = {}
 if table_exists("market_weekly"):
     for x in q("SELECT semana_ini, semana_fin, total_bsd FROM market_weekly"):
         bulletins[monday(x["semana_ini"])] = (x["semana_fin"], x["total_bsd"])
+last_bulletin = max(bulletins) if bulletins else "0000"
 
 # [monday, last day, rv_usd, rf_usd, ob_usd, total_usd, rv_bsd, rf_bsd, ob_bsd, total_bsd,
-#  regular_usd, plazo_usd]
+#  regular_usd, plazo_usd, partial (1 = no bulletin yet: figures so far)]
 vol_weekly = []
 for m in sorted(set(weeks) | set(bulletins)):
     if m < "2025-03-03":
         continue
     w = weeks.get(m, blank(m))
     fin, tot = bulletins.get(m, (w["fin"], None))
-    ob = max(0.0, tot - w["rv"] - w["rf"]) if tot is not None else (w["ob"] or None)
+    partial = 0
+    if tot is not None:
+        ob = max(0.0, tot - w["rv"] - w["rf"])
+    elif w["ob"]:
+        ob = w["ob"]
+    elif cfb_from and m > last_bulletin and fin >= cfb_from:
+        ob = w["cfb"]                           # week in progress (can be 0)
+        tot = w["rv"] + w["rf"] + ob
+        partial = 1
+    else:
+        ob = None
     o = avg_of(m, fin)
     usd_ = lambda v: round(v / o) if (v is not None and o) else None
     vol_weekly.append([m, fin, usd_(w["rv"]), usd_(w["rf"]), usd_(ob), usd_(tot),
                        round(w["rv"]), round(w["rf"]), round(ob) if ob is not None else None,
                        round(tot) if tot is not None else None,
-                       usd_(w["rv"] - w["pla"]), usd_(w["pla"])])
+                       usd_(w["rv"] - w["pla"]), usd_(w["pla"]), partial])
 rv_reg_ytd = sum((w[10] or 0) for w in vol_weekly if w[1] >= year_start)
 rv_pla_ytd = sum((w[11] or 0) for w in vol_weekly if w[1] >= year_start)
 
@@ -448,7 +474,7 @@ rf_ytd_usd = sum(w[3] or 0 for w in wk_ytd)
 ob_ytd_usd = sum(w[4] or 0 for w in wk_ytd)
 wk_with_total = [w for w in wk_ytd if w[5]]
 rv_share = (sum(w[2] or 0 for w in wk_with_total) / total_ytd_usd * 100) if total_ytd_usd else None
-weekly = [w for w in vol_weekly if w[5] is not None]
+weekly = [w for w in vol_weekly if w[5] is not None and not w[12]]
 
 conn.close()
 os.remove(_tmp_db)

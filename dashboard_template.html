@@ -459,16 +459,24 @@ function drawCap() {
   });
 }
 
-// Weekly volume rows: [monday, last day, rv_usd, rf_usd, ob_usd, total_usd, rv_bsd, rf_bsd, ob_bsd, total_bsd]
+// Weekly volume rows: [monday, last day, rv_usd, rf_usd, ob_usd, total_usd, rv_bsd, rf_bsd, ob_bsd, total_bsd,
+//  regular_usd, plazo_usd, partial]  — partial = week in progress (no bulletin yet)
+const weekTitle = (r) => {
+  const base = `Semana del ${fdate(r[0], false)} al ${fdate(r[1])}`;
+  if (!r[12]) return base;
+  return r === S.weekly[S.weekly.length - 1] ? `Semana en curso · ${base.slice(7)}` : `${base} · preliminar (sin boletín aún)`;
+};
 function weekBars(canvasId, col, colBs, color, label) {
   const rows = S.weekly.filter(r => r[col] != null);
   const labels = rows.map(r => r[0]);
   return new Chart(document.getElementById(canvasId), {
     type: 'bar',
-    data: {labels, datasets: [{label, data: rows.map(r => r[col]), backgroundColor: color + 'CC', hoverBackgroundColor: color, borderRadius: 3, barPercentage: .85, categoryPercentage: .9}]},
+    data: {labels, datasets: [{label, data: rows.map(r => r[col]),
+      backgroundColor: rows.map(r => color + (r[12] ? '66' : 'CC')), borderColor: color, borderWidth: rows.map(r => r[12] ? 1 : 0),
+      hoverBackgroundColor: color, borderRadius: 3, barPercentage: .85, categoryPercentage: .9}]},
     options: {responsive: true, maintainAspectRatio: false, animation: false,
       plugins: {legend: {display: false}, tooltip: {...TT, displayColors: false, callbacks: {
-        title: (it) => { const r = rows[it[0].dataIndex]; return `Semana del ${fdate(r[0], false)} al ${fdate(r[1])}`; },
+        title: (it) => weekTitle(rows[it[0].dataIndex]),
         label: (it) => ` ${usd(it.raw)}`, afterLabel: (it) => ` ${fmt(rows[it.dataIndex][colBs] / 1e6, 1)} millones de Bs.`}}},
       scales: {x: {grid: {display: false}, ticks: xTicks(labels)}, y: {position: 'right', ticks: {callback: (v) => usd(v)}}}}
   });
@@ -485,7 +493,7 @@ function drawRV() {
       {label: 'Mercado a plazo', data: rows.map(r => r[11]), backgroundColor: '#A5B4FC66', borderColor: '#A5B4FC', borderWidth: {top: 1, left: 0, right: 0, bottom: 0}, borderRadius: 2, stack: 'rv', barPercentage: .85, categoryPercentage: .9, pointStyle: 'rect'}]},
     options: {responsive: true, maintainAspectRatio: false, animation: false, interaction: {mode: 'index', intersect: false},
       plugins: {legend: {...LEG, labels: {...LEG.labels, boxWidth: 10, boxHeight: 10}}, tooltip: {...TT, callbacks: {
-        title: (it) => { const r = rows[it[0].dataIndex]; return `Semana del ${fdate(r[0], false)} al ${fdate(r[1])}`; },
+        title: (it) => weekTitle(rows[it[0].dataIndex]),
         label: (it) => ` ${it.dataset.label}: ${usd(it.raw)}`, footer: (it) => `Total: ${usd(rows[it[0].dataIndex][2])}`}}},
       scales: {x: {stacked: true, grid: {display: false}, ticks: xTicks(labels)}, y: {stacked: true, position: 'right', ticks: {callback: (v) => usd(v)}}}}
   });
@@ -497,9 +505,11 @@ function drawRF() {
   rfChart = weekBars('rfChart', ob ? 4 : 3, ob ? 8 : 7, ob ? '#14B8A6' : '#7C5CFF', ob ? 'Otros bienes' : 'Renta fija');
   document.getElementById('rfTitle').textContent = ob ? 'Mercado de otros bienes' : 'Volumen de renta fija';
   const share = (v) => K.vol_total_ytd ? ` · ${fmt(v / K.vol_total_ytd * 100, 1)}% del total negociado en la BVC` : '';
+  const cur = S.weekly.length && S.weekly[S.weekly.length - 1][12] ? S.weekly[S.weekly.length - 1] : null;
+  const curTxt = (col) => cur && cur[col] != null ? ` · semana en curso: ${usd(cur[col])}` : '';
   document.getElementById('rfSub').textContent = ob
-    ? `Certificados de financiamiento bursátil · ${META.year}: ${usd(K.vol_ob_ytd)}${share(K.vol_ob_ytd)}`
-    : `Semanal · USD al BCV · ${META.year}: ${usd(K.vol_rf_ytd)}${share(K.vol_rf_ytd)}`;
+    ? `Certificados de financiamiento bursátil · ${META.year}: ${usd(K.vol_ob_ytd)}${share(K.vol_ob_ytd)}${curTxt(4)}`
+    : `Semanal · USD al BCV · ${META.year}: ${usd(K.vol_rf_ytd)}${share(K.vol_rf_ytd)}${curTxt(3)}`;
 }
 
 // ── top movers ───────────────────────────────────────────────────────────────

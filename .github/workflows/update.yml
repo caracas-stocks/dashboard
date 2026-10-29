@@ -62,6 +62,10 @@ jobs:
         run: python load_market_reports.py
         continue-on-error: true
 
+      - name: Otros bienes (CFB) day by day, for the week in progress
+        run: python load_otros_bienes.py
+        continue-on-error: true
+
       - name: Data quality and DB size maintenance
         run: python maintenance.py
         continue-on-error: true
